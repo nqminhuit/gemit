@@ -87,7 +87,7 @@ variable, then auth-source, then prompted (cached for the session)."
                      (ignore-errors
                        (auth-source-pick-first-password
                         :host "generativelanguage.googleapis.com"))
-                     (read-passwd "Gemini API key: "))))
+                     (read-passwd "Gemini API key (paste with C-y): "))))
         (when (and (stringp key) (not (string-empty-p (string-trim key))))
           (setq gemit--api-key-cache (string-trim key))))))
 
