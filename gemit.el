@@ -47,11 +47,20 @@
   :prefix "gemit-")
 
 (defcustom gemit-commit-prompt
-  "You are an expert at writing Git commits. Your job is to write a short clear commit message that summarizes the changes. Follow closely the Conventional Commits (https://www.conventionalcommits.org/en/v1.0.0/). The commit message should be structured as follows:
+  "Write a Conventional Commits message for the given diff.
 
-    <type>(<optional scope>): <description>
+Format:
+<type>(<scope>): <description>
 
-    [optional body]"
+<body>
+
+Rules:
+- type: feat|fix|refactor|perf|test|docs|style|chore|build|ci
+- description: imperative mood, lowercase, no period, ≤50 chars
+- scope: jiraTicketID if available (from branch name or provided context); otherwise omit scope entirely, including the parentheses
+- body: only if the diff needs context beyond the summary line; wrap at 72 chars; omit for trivial/small changes
+- Base everything strictly on the diff. No speculation about intent.
+- Output ONLY the commit message. No preamble, no explanation, no markdown formatting/backticks."
   "Prompt for commit generation; input is the staged diff."
   :type 'string
   :group 'gemit)
