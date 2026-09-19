@@ -164,5 +164,58 @@
     (should (= 2 (length msgs)))
     (should (string-match-p "gemit: denied" (car msgs)))))
 
+;;;; gemit--invalid-key-error-p and cache eviction
+
+(ert-deftest gemit-test-invalid-key-matches-rejections ()
+  (should (gemit--invalid-key-error-p
+           "API key not valid. Please pass a valid API key."))
+  (should (gemit--invalid-key-error-p "API_KEY_INVALID"))
+  (should (gemit--invalid-key-error-p
+           "API key expired. Please renew the API key."))
+  (should (gemit--invalid-key-error-p
+           "API keys are not supported by this API.")))
+
+(ert-deftest gemit-test-invalid-key-ignores-other-failures ()
+  ;; A restricted project or quota failure must NOT evict a good key.
+  (should-not (gemit--invalid-key-error-p
+               "Your project has been denied access. Please contact support."))
+  (should-not (gemit--invalid-key-error-p "No response content from Gemini API"))
+  (should-not (gemit--invalid-key-error-p nil)))
+
+(defmacro gemit-test--with-stubbed-retrieve (body-message &rest body)
+  "Run BODY with `url-retrieve' answering BODY-MESSAGE as an API error."
+  (declare (indent 1))
+  `(cl-letf (((symbol-function 'url-retrieve)
+              (lambda (_url callback &rest _)
+                (with-temp-buffer
+                  (insert (format "{\"error\": {\"message\": %S}}" ,body-message))
+                  (let ((url-http-end-of-headers (point-min)))
+                    (funcall callback '(:error (error http 400)))))))
+             ((symbol-function 'read-passwd)
+              (lambda (&rest _) (error "must not prompt"))))
+     ,@body))
+
+(ert-deftest gemit-test-rejected-key-evicts-cache ()
+  (gemit-test--with-clean-env
+    (let ((gemit--api-key-cache "bad-key")
+          (gemit-api-key nil)
+          (seen nil))
+      (gemit-test--with-stubbed-retrieve "API key not valid. Please pass a valid API key."
+        (gemit--request-async "diff" "system"
+          (lambda (response err) (setq seen (or response err)))))
+      (should (null gemit--api-key-cache))
+      (should (string-match-p "not valid" seen)))))
+
+(ert-deftest gemit-test-denied-project-keeps-cache ()
+  (gemit-test--with-clean-env
+    (let ((gemit--api-key-cache "good-key")
+          (gemit-api-key nil)
+          (seen nil))
+      (gemit-test--with-stubbed-retrieve "Your project has been denied access. Please contact support."
+        (gemit--request-async "diff" "system"
+          (lambda (response err) (setq seen (or response err)))))
+      (should (equal "good-key" gemit--api-key-cache))
+      (should (string-match-p "denied access" seen)))))
+
 (provide 'gemit-test)
 ;;; gemit-test.el ends here

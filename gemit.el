@@ -99,6 +99,15 @@ variable, then auth-source, then prompted (cached for the session)."
               (parts (plist-get (plist-get (elt cands 0) :content) :parts)))
     (plist-get (elt parts 0) :text)))
 
+(defun gemit--invalid-key-error-p (msg)
+  "Non-nil if MSG means the API rejected the key itself.
+Other failures (a restricted project, quota, model issues) leave a
+correctly-typed key alone, so they never trigger a re-prompt."
+  (and (stringp msg)
+       (let ((case-fold-search t))
+         (string-match-p "api[_ ]key[_ ]\\(not valid\\|expired\\|invalid\\)\\|api keys are not supported"
+                         msg))))
+
 (defun gemit--api-error (status-error)
   "Describe STATUS-ERROR, preferring the API's own error message."
   (or (ignore-errors
@@ -128,7 +137,14 @@ Calls CALLBACK with (RESPONSE nil) on success or (nil ERROR-MSG) on failure."
        (lambda (status)
          (condition-case err
              (if-let* ((e (plist-get status :error)))
-                 (funcall callback nil (gemit--api-error e))
+                 (let ((msg (gemit--api-error e)))
+                   ;; A rejected key is forgotten, so the next attempt
+                   ;; re-prompts instead of failing the whole session.
+                   ;; Keys from the setting/env obviously resolve again,
+                   ;; so only prompted keys effectively retry.
+                   (when (gemit--invalid-key-error-p msg)
+                     (setq gemit--api-key-cache nil))
+                   (funcall callback nil msg))
                (goto-char url-http-end-of-headers)
                (let* ((resp (json-parse-buffer :object-type 'plist))
                       (text (gemit--response-text resp)))

@@ -16,7 +16,8 @@ of these ways (first one found wins):
 2. `export GEMINI_API_KEY_GEMIT=...`,
 3. an auth-source entry (`~/.authinfo.gpg`):
    `machine generativelanguage.googleapis.com login apikey password <KEY>`,
-4. nothing -- you are prompted once per Emacs session.
+4. nothing -- you are prompted once per Emacs session (a key the
+   API rejects is forgotten, so the next attempt asks again).
 
 **Doom:**
 
