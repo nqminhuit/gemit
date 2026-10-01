@@ -22,6 +22,7 @@
 (defvar url-request-extra-headers)
 (defvar url-max-redirections)
 (defvar url-proxy-services)
+(defvar url-proxy-locator)
 (defvar git-commit-summary-max-length)
 
 ;; `cl-letf' needs an existing function cell to stub; CI has no Magit, so
@@ -349,6 +350,45 @@
       (should (equal "system λ" (plist-get (aref messages 0) :content)))
       (should (equal "diff — café" (plist-get (aref messages 1) :content))))))
 
+(ert-deftest gemit-test-real-loopback-transport-bypasses-proxies ()
+  (require 'url-http)
+  (let* ((proxy-url "http://proxy.example.invalid:8888")
+         (process-environment (copy-sequence process-environment))
+         (url-setup-done t)
+         (url-retrieve-number-of-calls 1)
+         (url-proxy-services nil)
+         (selected-proxy 'unset)
+         (custom-locator-calls 0))
+    (setenv "HTTP_PROXY" proxy-url)
+    (setenv "http_proxy" proxy-url)
+    (setenv "NO_PROXY" nil)
+    (setenv "no_proxy" nil)
+    (cl-letf (((symbol-function 'url-http-find-free-connection)
+               (lambda (&rest _)
+                 (setq selected-proxy url-using-proxy)
+                 nil)))
+      (let ((url-proxy-locator #'url-default-find-proxy-for-url))
+        (gemit--url-retrieve-async
+         (concat gemit-test--local-root gemit-test--health-path)
+         nil t "GET" nil nil (lambda (&rest _) nil)))
+      (should-not selected-proxy)
+      (let ((url-proxy-locator
+             (lambda (_url _host)
+               (setq custom-locator-calls (1+ custom-locator-calls))
+               "DIRECT")))
+        (gemit--url-retrieve-async
+         (concat gemit-test--local-root gemit-test--health-path)
+         nil t "GET" nil nil (lambda (&rest _) nil)))
+      (should (= 0 custom-locator-calls))
+      (let ((url-proxy-locator
+             (lambda (_url _host)
+               (setq custom-locator-calls (1+ custom-locator-calls))
+               "DIRECT")))
+        (gemit--url-retrieve-async
+         "http://example.invalid/health"
+         nil nil "GET" nil nil (lambda (&rest _) nil)))
+      (should (> custom-locator-calls 0)))))
+
 (ert-deftest gemit-test-local-configured-model-skips-discovery ()
   (let ((records nil)
         (result nil)
@@ -522,7 +562,147 @@
     (should (string-prefix-p "https://generativelanguage.googleapis.com/"
                              (plist-get (car records) :url))))))
 
-;;;; Real timeout cleanup using fake timers only
+;;;; Timeout cleanup
+
+(defun gemit-test--running-request-buffer (name query-count)
+  "Return a buffer with a live network-free process and query counter.
+NAME labels the test buffer; QUERY-COUNT is incremented if killing prompts."
+  (let ((buffer (generate-new-buffer name)))
+    (with-current-buffer buffer
+      (setq-local kill-buffer-query-functions
+                  (list (lambda () (setcar query-count (1+ (car query-count)))
+                          t)))
+      (make-pipe-process :name name :buffer buffer :noquery t))
+    buffer))
+
+(ert-deftest gemit-test-local-timeout-aborts-process-without-querying ()
+  (let ((timers nil)
+        (result nil)
+        (calls 0)
+        (calls-during-startup nil)
+        (query-count (list 0))
+        (gemit-backend 'local)
+        (gemit-local-model gemit-test--configured-model)
+        (gemit-local-availability-timeout 0.25)
+        pending-callback request-buffer request-process)
+    (gemit-test--with-fake-timers timers
+      (cl-letf (((symbol-function 'url-retrieve)
+                 (lambda (_url callback &rest _)
+                   (setq pending-callback callback
+                         request-buffer
+                         (gemit-test--running-request-buffer
+                          " *gemit-running-timeout*" query-count)
+                         request-process (get-buffer-process request-buffer))
+                   (funcall (aref (car timers) 1))
+                   (setq calls-during-startup calls)
+                   request-buffer)))
+        (gemit--request-async
+         gemit-test--diff gemit-test--system-prompt
+         (lambda (response error-msg)
+           (setq calls (1+ calls) result (list response error-msg)))))
+      (should (= 0 calls-during-startup))
+      (should (= 1 calls))
+      (should (string-match-p "timed out" (cadr result)))
+      (should (aref (car timers) 3))
+      (should-not (buffer-live-p request-buffer))
+      (should-not (process-live-p request-process))
+      (should (= 0 (car query-count)))
+      (let ((late-buffer (generate-new-buffer " *gemit-running-late*")))
+        (with-current-buffer late-buffer
+          (let ((url-http-end-of-headers (point-min)))
+            (funcall pending-callback nil)))
+        (should-not (buffer-live-p late-buffer)))
+      (should (= 1 calls)))))
+
+(ert-deftest gemit-test-auto-timeout-cleans-before-fallback-consent ()
+  (let ((timers nil)
+        (result nil)
+        (calls 0)
+        (prompt-calls 0)
+        (key-lookups 0)
+        (query-count (list 0))
+        request-buffer request-process
+        (gemit-backend 'auto)
+        (gemit-local-model gemit-test--configured-model)
+        (gemit-local-availability-timeout 0.25))
+    (gemit-test--with-fake-timers timers
+      (cl-letf (((symbol-function 'url-retrieve)
+                 (lambda (_url _callback &rest _)
+                   (setq request-buffer
+                         (gemit-test--running-request-buffer
+                          " *gemit-auto-timeout*" query-count))
+                   request-buffer))
+                ((symbol-function 'y-or-n-p)
+                 (lambda (&rest _)
+                   (setq prompt-calls (1+ prompt-calls))
+                   (should-not (buffer-live-p request-buffer))
+                   (should-not (process-live-p request-process))
+                   nil))
+                ((symbol-function 'gemit--api-key-for-setting)
+                 (lambda (&rest _)
+                   (setq key-lookups (1+ key-lookups))
+                   (error "Declined fallback must not look up a key"))))
+        (gemit--request-async
+         gemit-test--diff gemit-test--system-prompt
+         (lambda (response error-msg)
+           (setq calls (1+ calls) result (list response error-msg))))
+      (setq request-process (get-buffer-process request-buffer))
+      (should (process-live-p request-process))
+      (funcall (aref (car timers) 1))
+      (should (= 1 prompt-calls))
+      (should (= 0 key-lookups))
+      (should (= 1 calls))
+      (should (string-match-p "fallback declined" (cadr result)))
+      (should-not (buffer-live-p request-buffer))
+      (should-not (process-live-p request-process))
+      (should (= 0 (car query-count)))))))
+
+(ert-deftest gemit-test-local-generation-timeout-aborts-process-without-querying ()
+  (let ((timers nil)
+        (result nil)
+        (calls 0)
+        (query-count (list 0))
+        pending-callback generation-buffer generation-process
+        (gemit-backend 'local)
+        (gemit-local-model nil)
+        (gemit-local-generation-timeout 37))
+    (gemit-test--with-fake-timers timers
+      (cl-letf (((symbol-function 'url-retrieve)
+                 (lambda (url callback &rest _)
+                   (if (string-suffix-p gemit-test--chat-completions-path url)
+                       (progn
+                         (setq pending-callback callback
+                               generation-buffer
+                                (gemit-test--running-request-buffer
+                                 " *gemit-running-generation*" query-count))
+                         generation-buffer)
+                     (let ((buffer (generate-new-buffer " *gemit-fast-http*")))
+                       (with-current-buffer buffer
+                         (insert (if (string-suffix-p gemit-test--health-path url)
+                                     gemit-test--health-body
+                                   gemit-test--models-body))
+                         (let ((url-http-end-of-headers (point-min)))
+                           (funcall callback nil)))
+                       buffer)))))
+        (gemit--request-async
+         gemit-test--diff gemit-test--system-prompt
+         (lambda (response error-msg)
+           (setq calls (1+ calls) result (list response error-msg)))))
+      (setq generation-process (get-buffer-process generation-buffer))
+      (should (= 3 (length timers)))
+      (should (process-live-p generation-process))
+      (funcall (aref (car timers) 1))
+      (should (= 1 calls))
+      (should (string-match-p "timed out" (cadr result)))
+      (should-not (buffer-live-p generation-buffer))
+      (should-not (process-live-p generation-process))
+      (should (= 0 (car query-count)))
+      (let ((late-buffer (generate-new-buffer " *gemit-generation-late*")))
+        (with-current-buffer late-buffer
+          (let ((url-http-end-of-headers (point-min)))
+            (funcall pending-callback nil)))
+        (should-not (buffer-live-p late-buffer)))
+      (should (= 1 calls)))))
 
 (ert-deftest gemit-test-local-availability-timeout-completes-once-and-cleans-late-buffer ()
   (let ((timers nil)
@@ -596,8 +776,13 @@
       (should (= 3 (length records))))))
 
 (ert-deftest gemit-test-url-startup-errors-and-nil-returns-complete-once ()
-  (dolist (fixture (list (list :startup-error t) (list :return-nil t)))
-    (let ((records nil)
+  (dolist (case (list (cons (list :startup-error t)
+                           "Could not start URL request: simulated URL startup error")
+                     (cons (list :return-nil t)
+                           "URL request returned no buffer")))
+    (let ((fixture (car case))
+          (expected (cdr case))
+          (records nil)
           (timers nil)
           (result nil)
           (calls 0)
@@ -609,11 +794,11 @@
            gemit-test--staged-diff gemit-test--system-prompt
            (lambda (response error-msg)
              (setq calls (1+ calls) result (list response error-msg)))))
-        (should (= 1 calls))
-        (should (null (car result)))
-        (should (string-match-p "request\\|response" (cadr result)))
-        (should (aref (car timers) 3))
-        (should (= 1 (length records)))))))
+         (should (= 1 calls))
+         (should (null (car result)))
+         (should (equal expected (cadr result)))
+         (should (aref (car timers) 3))
+         (should (= 1 (length records)))))))
 
 (ert-deftest gemit-test-local-callback-exception-does-not-repeat-completion ()
   (let ((records nil)

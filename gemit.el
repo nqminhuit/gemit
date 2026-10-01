@@ -42,6 +42,7 @@
 (defvar git-commit-mode-map)
 (defvar git-commit-summary-max-length)
 (defvar url-http-end-of-headers)
+(defvar url-proxy-locator)
 
 (defgroup gemit nil
   "Generate commit messages with a local LLM or Google Gemini."
@@ -175,36 +176,68 @@ METHOD, DATA, and HEADERS configure the HTTP request.  LOCAL-REQUEST-P
 disables redirects and bypasses proxies for loopback URLs.  CALLBACK receives
 the status plist and response buffer; both are nil when no buffer exists."
   (let ((done nil)
+        (starting nil)
+        pending-completion
         timer request-buffer)
     (cl-labels
-        ((finish (status buffer)
+        ((discard-buffer (buffer abort-request)
+           (when (buffer-live-p buffer)
+             (with-current-buffer buffer
+               (let ((kill-buffer-query-functions nil))
+                 (when abort-request
+                   (let ((process (get-buffer-process buffer)))
+                     (when (and (processp process)
+                                (process-live-p process)
+                                (eq (process-buffer process) buffer))
+                       (delete-process process))))
+                 (when (buffer-live-p buffer)
+                   (kill-buffer buffer))))))
+         (deliver (status buffer abort-request)
+           (when abort-request
+             (discard-buffer buffer t))
+           (unwind-protect
+               (condition-case err
+                   (funcall callback status buffer)
+                 (error
+                  (message "gemit: Request callback failed: %s"
+                           (error-message-string err))))
+             (unless abort-request
+               (discard-buffer buffer nil))))
+         (finish (status buffer &optional abort-request)
            (unless done
              (setq done t
                    request-buffer (or buffer request-buffer))
              (when timer
                (cancel-timer timer)
                (setq timer nil))
-             (unwind-protect
-                 (condition-case err
-                     (funcall callback status buffer)
-                   (error
-                    (message "gemit: Request callback failed: %s"
-                             (error-message-string err))))
-               (when (buffer-live-p request-buffer)
-                 (kill-buffer request-buffer)))))
+             (if (and starting (not request-buffer))
+                 (setq pending-completion
+                       (list status buffer abort-request))
+               (deliver status request-buffer abort-request))))
          (receive (status)
            (if done
-               (when (buffer-live-p (current-buffer))
-                 (kill-buffer (current-buffer)))
+               (let ((buffer (current-buffer)))
+                 (setq request-buffer (or request-buffer buffer))
+                 (discard-buffer
+                  buffer
+                  (and pending-completion
+                       (nth 2 pending-completion))))
              (finish status (current-buffer))))
          (timeout-request ()
            (finish (list :error
                          (list 'error
                                (format "Request timed out after %s seconds"
                                        timeout)))
-                   request-buffer)))
+                   request-buffer t))
+         (finish-pending-completion ()
+           (when pending-completion
+             (let ((completion pending-completion))
+               (setq pending-completion nil)
+               (deliver (car completion) request-buffer
+                        (nth 2 completion))))))
       (when timeout
         (setq timer (run-at-time timeout nil #'timeout-request)))
+      (setq starting t)
       (condition-case err
           (let ((url-request-method method)
                 (url-request-data data)
@@ -216,30 +249,36 @@ the status plist and response buffer; both are nil when no buffer exists."
                 (url-proxy-services
                  (if (and local-request-p (gemit--loopback-url-p url))
                      nil
-                   url-proxy-services)))
-            (setq request-buffer (url-retrieve url #'receive nil t))
-            (unless done
-              (unless (buffer-live-p request-buffer)
-                (finish '(:error (error "URL request returned no buffer"))
-                        nil)))
-            (when (and done (buffer-live-p request-buffer))
-              (kill-buffer request-buffer)))
+                   url-proxy-services))
+                (url-proxy-locator
+                 (if (and local-request-p (gemit--loopback-url-p url))
+                     (lambda (_url _host) "DIRECT")
+                   url-proxy-locator)))
+            (setq request-buffer (url-retrieve url #'receive nil t)))
         (quit
+         (setq starting nil
+               pending-completion nil)
          (unless done
            (setq done t)
            (when timer
              (cancel-timer timer)
              (setq timer nil))
-           (when (buffer-live-p request-buffer)
-             (kill-buffer request-buffer)))
+           (discard-buffer request-buffer t))
          (signal (car err) (cdr err)))
         (error
+         (setq starting nil)
          (unless done
            (finish (list :error
                          (list 'error
                                (format "Could not start URL request: %s"
                                        (error-message-string err))))
-                   nil)))))))
+                   nil))))
+      (setq starting nil)
+      (finish-pending-completion)
+      (unless done
+        (unless (buffer-live-p request-buffer)
+          (finish '(:error (error "URL request returned no buffer"))
+                  nil))))))
 
 (defun gemit--gemini-handle-response (status callback)
   "Handle a Gemini response STATUS and call CALLBACK once."
@@ -347,14 +386,18 @@ for completion; deliver a response or error to CALLBACK."
          (funcall callback nil reason))
        (request-json (url timeout method data headers next)
          (gemit--url-retrieve-async
-          url timeout t method data headers
-          (lambda (status buffer)
-            (condition-case err
-                (if (not (buffer-live-p buffer))
-                    (error "Local server returned no response")
-                  (with-current-buffer buffer
-                    (funcall next (gemit--local-json-response status))))
-              (error (fail (error-message-string err)))))))
+           url timeout t method data headers
+           (lambda (status buffer)
+             (condition-case err
+                 (if (plist-get status :error)
+                     (error "%s"
+                            (gemit--local-error-message
+                             (plist-get status :error)))
+                   (if (not (buffer-live-p buffer))
+                       (error "Local server returned no response")
+                     (with-current-buffer buffer
+                       (funcall next (gemit--local-json-response status)))))
+               (error (fail (error-message-string err)))))))
        (generate (selected-model)
          (let* ((url (gemit--local-endpoint
                       endpoint gemit--local-completions-path))
