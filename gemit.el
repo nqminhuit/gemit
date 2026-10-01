@@ -63,6 +63,13 @@
   :type 'string
   :group 'gemit)
 
+(defcustom gemit-local-api-key nil
+  "Optional llama.cpp API key or file holding it.
+When nil or blank, GEMIT_LOCAL_API_KEY is used if set.  This credential is
+separate from the Google Gemini API key and is never prompted for."
+  :type '(choice string (const nil))
+  :group 'gemit)
+
 (defcustom gemit-local-model nil
   "Model alias for the local server, or nil to discover its single model."
   :type '(choice (const :tag "Discover the loaded model" nil) string)
@@ -83,6 +90,8 @@
 (defconst gemit--local-completions-path "/v1/chat/completions")
 (defconst gemit--json-content-type "application/json")
 (defconst gemit--api-key-env-var "GEMINI_API_KEY_GEMIT")
+(defconst gemit--local-api-key-env-var "GEMIT_LOCAL_API_KEY")
+(defconst gemit--local-api-key-error "Invalid local API key configuration")
 
 (defcustom gemit-commit-prompt
   "Write a Conventional Commits message for the given diff.
@@ -141,6 +150,40 @@ variable, then auth-source, then prompted (cached for the session)."
 (defun gemit--api-key ()
   "Return the Gemini API key: setting, env, auth-source, then prompt."
   (gemit--api-key-for-setting gemit-api-key))
+
+(defun gemit--normalize-local-api-key (key)
+  "Return trimmed local KEY, or nil when it is blank.
+Reject values that cannot safely be used in an HTTP header."
+  (when key
+    (unless (stringp key)
+      (error "%s" gemit--local-api-key-error))
+    (let ((trimmed (string-trim key)))
+      (when (string-match-p "[\r\n]" trimmed)
+        (error "%s" gemit--local-api-key-error))
+      (unless (string-empty-p trimmed)
+        trimmed))))
+
+(defun gemit--local-api-key ()
+  "Resolve the local API key setting, then its environment fallback.
+Errors are generic so a key is never included in diagnostics."
+  (condition-case nil
+      (let ((configured
+             (if (null gemit-local-api-key)
+                 nil
+               (unless (stringp gemit-local-api-key)
+                 (error "%s" gemit--local-api-key-error))
+               (gemit--resolve-api-key gemit-local-api-key))))
+        (or (gemit--normalize-local-api-key configured)
+            (gemit--normalize-local-api-key
+             (getenv gemit--local-api-key-env-var))))
+    (error (error "%s" gemit--local-api-key-error))))
+
+(defun gemit--local-request-headers (api-key &optional json-p)
+  "Return local request headers for API-KEY and optional JSON-P content."
+  (append (when json-p
+            `(("content-type" . ,gemit--json-content-type)))
+          (when api-key
+            `(("Authorization" . ,(concat "Bearer " api-key))))))
 
 ;;; Gemini API call
 
@@ -377,10 +420,12 @@ CONFIG snapshots the model and key setting for a dispatched request."
   (json-parse-buffer :object-type 'plist))
 
 (defun gemit--local-request-async
-  (prompt system endpoint model availability-timeout generation-timeout callback)
+  (prompt system endpoint model api-key availability-timeout
+          generation-timeout callback)
   "Send PROMPT and SYSTEM to the llama.cpp server at ENDPOINT using MODEL.
-Use AVAILABILITY-TIMEOUT for readiness/discovery and GENERATION-TIMEOUT
-for completion; deliver a response or error to CALLBACK."
+API-KEY is fixed for the complete request flow.  Use AVAILABILITY-TIMEOUT for
+readiness/discovery and GENERATION-TIMEOUT for completion; deliver a response
+or error to CALLBACK."
   (cl-labels
       ((fail (reason)
          (funcall callback nil reason))
@@ -412,7 +457,7 @@ for completion; deliver a response or error to CALLBACK."
                   'utf-8)))
            (request-json
             url generation-timeout "POST" data
-            `(("content-type" . ,gemit--json-content-type))
+            (gemit--local-request-headers api-key t)
             (lambda (response)
               (let* ((choices (plist-get response :choices))
                      (message (and (vectorp choices) (> (length choices) 0)
@@ -422,11 +467,12 @@ for completion; deliver a response or error to CALLBACK."
                          (not (string-empty-p (string-trim content))))
                     (funcall callback content nil)
                   (fail "Local server returned no nonblank message content")))))))
-       (discover-model ()
-         (request-json
-          (gemit--local-endpoint endpoint gemit--local-models-path)
-          availability-timeout "GET" nil nil
-          (lambda (response)
+        (discover-model ()
+          (request-json
+           (gemit--local-endpoint endpoint gemit--local-models-path)
+           availability-timeout "GET" nil
+           (gemit--local-request-headers api-key)
+           (lambda (response)
             (let* ((data (plist-get response :data))
                    (ids (and (vectorp data)
                              (delq nil
@@ -445,11 +491,12 @@ for completion; deliver a response or error to CALLBACK."
                ((cdr ids)
                 (fail "Multiple local model IDs are ambiguous; configure gemit-local-model"))
                (t (generate (car ids))))))))
-       (check-health ()
-         (request-json
-          (gemit--local-endpoint endpoint gemit--local-health-path)
-          availability-timeout "GET" nil nil
-          (lambda (response)
+        (check-health ()
+          (request-json
+           (gemit--local-endpoint endpoint gemit--local-health-path)
+           availability-timeout "GET" nil
+           (gemit--local-request-headers api-key)
+           (lambda (response)
             (if (equal (plist-get response :status) "ok")
                 (if model
                     (if (stringp model)
@@ -502,20 +549,21 @@ CALLBACK receives (RESPONSE nil) on success or (nil ERROR-MSG) on failure."
                                (format "Gemini fallback confirmation failed; staged diff was not sent: %s"
                                        (error-message-string err))))))
              (complete nil reason))))
-      (pcase backend
-        ('gemini
-         (gemit--gemini-request-async prompt system #'complete gemini-config))
-        ((or 'auto 'local)
-         (condition-case err
-             (gemit--local-request-async
-              prompt system (gemit--normalize-local-url local-url)
-              local-model availability-timeout
-              generation-timeout
-              (lambda (response error-msg)
-                (if response
-                    (complete response nil)
-                  (local-failed error-msg))))
-           (error (local-failed (error-message-string err)))))
+       (pcase backend
+         ('gemini
+          (gemit--gemini-request-async prompt system #'complete gemini-config))
+         ((or 'auto 'local)
+          (condition-case err
+              (let ((local-api-key (gemit--local-api-key)))
+                (gemit--local-request-async
+                 prompt system (gemit--normalize-local-url local-url)
+                 local-model local-api-key availability-timeout
+                 generation-timeout
+                 (lambda (response error-msg)
+                   (if response
+                       (complete response nil)
+                     (local-failed error-msg)))))
+            (error (local-failed (error-message-string err)))))
         (_ (complete nil (format "Unknown gemit-backend: %S" backend)))))))
 
 ;;; Commit message formatting

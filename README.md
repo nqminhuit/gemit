@@ -20,11 +20,32 @@ gemit does not start a server or download models. With no configured model,
 gemit reads `/v1/models` and requires a single unambiguous model ID. For
 multiple IDs, set an explicit alias.
 
+For a server started with llama.cpp API-key authentication, configure the same
+key in gemit. For example, start the server with a placeholder key and set
+gemit's option or point it to a file containing the key:
+
+```sh
+llama-server -m /path/to/model.gguf --host 127.0.0.1 --port 8080 \
+  --api-key 'YOUR-LOCAL-KEY'
+```
+
+```elisp
+(setopt gemit-local-api-key "YOUR-LOCAL-KEY") ; or a file path
+```
+
+Alternatively, set `GEMIT_LOCAL_API_KEY`. A nonblank `gemit-local-api-key`
+setting (including a file's contents) takes precedence; nil or a blank value
+falls back to the environment variable. The local credential is optional by
+default, is never prompted for, and is separate from the Google Gemini key.
+When configured, it is sent as a Bearer token to local health, model-discovery,
+and completion endpoints.
+
 Defaults and customization:
 
 ```elisp
 (setopt gemit-backend 'auto) ; auto, local, or gemini
 (setopt gemit-local-url "http://127.0.0.1:8080") ; server root URL
+(setopt gemit-local-api-key nil) ; optional local key or file; env fallback
 (setopt gemit-local-model nil) ; discover one loaded model, or set an alias
 (setopt gemit-local-availability-timeout 2) ; seconds per health/discovery request
 (setopt gemit-local-generation-timeout 120) ; seconds for generation

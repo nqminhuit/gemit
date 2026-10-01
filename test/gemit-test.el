@@ -38,6 +38,14 @@
 (defconst gemit-test--diff "diff")
 (defconst gemit-test--empty-string "")
 (defconst gemit-test--api-key "AIza-key")
+(defconst gemit-test--local-api-key "local-test-key")
+(defconst gemit-test--other-local-api-key "changed-local-key")
+(defconst gemit-test--env-local-api-key "env-local-key")
+(defconst gemit-test--file-local-api-key "file-local-key")
+(defconst gemit-test--authorization-header-name "Authorization")
+(defconst gemit-test--bearer-prefix "Bearer ")
+(defconst gemit-test--fallback-declined
+  "Gemini fallback declined; staged diff was not sent")
 (defconst gemit-test--typed-key "typed-key")
 (defconst gemit-test--denied-message "denied")
 (defconst gemit-test--short-message "fix: Short")
@@ -139,6 +147,18 @@
          (old-env (getenv gemit--api-key-env-var)))
      (unwind-protect (progn (setenv gemit--api-key-env-var) ,@body)
        (when old-env (setenv gemit--api-key-env-var old-env)))))
+
+(defmacro gemit-test--with-clean-local-env (&rest body)
+  "Run BODY with no local API-key environment variable set."
+  (declare (indent 0))
+  `(let ((process-environment (copy-sequence process-environment)))
+     (setenv gemit--local-api-key-env-var)
+     ,@body))
+
+(defun gemit-test--authorization-header (record)
+  "Return the Authorization header in request RECORD, if any."
+  (cdr (assoc gemit-test--authorization-header-name
+              (plist-get record :headers))))
 
 (ert-deftest gemit-test-api-key-custom-setting-wins ()
   (gemit-test--with-clean-env
@@ -309,16 +329,35 @@
   (should (eq 'auto (default-value 'gemit-backend)))
   (should (equal "http://127.0.0.1:8080" (default-value 'gemit-local-url)))
   (should-not (default-value 'gemit-local-model))
+  (should-not (default-value 'gemit-local-api-key))
   (should (= 2 (default-value 'gemit-local-availability-timeout)))
   (should (= 120 (default-value 'gemit-local-generation-timeout)))
   (should (equal "gemini-flash-lite-latest" (default-value 'gemit-model))))
+
+(ert-deftest gemit-test-local-api-key-setting-and-environment-precedence ()
+  (gemit-test--with-clean-local-env
+    (setenv gemit--local-api-key-env-var gemit-test--env-local-api-key)
+    (let ((gemit-local-api-key (concat "  " gemit-test--local-api-key " \t")))
+      (should (equal gemit-test--local-api-key (gemit--local-api-key))))
+    (let ((gemit-local-api-key " \t "))
+      (should (equal gemit-test--env-local-api-key (gemit--local-api-key))))
+    (let ((gemit-local-api-key nil))
+      (should (equal gemit-test--env-local-api-key (gemit--local-api-key))))
+    (setenv gemit--local-api-key-env-var " \t")
+    (let ((gemit-local-api-key nil))
+      (should-not (gemit--local-api-key)))
+    (let ((gemit-local-api-key 17))
+      (should-error (gemit--local-api-key) :type 'error))))
 
 (ert-deftest gemit-test-local-success-discovers-model-and-sends-json-false ()
   (let ((records nil)
         (result nil)
         (gemit-backend 'local)
         (gemit-local-url (concat gemit-test--local-root "///"))
-        (gemit-local-model nil))
+        (gemit-local-model nil)
+        (gemit-local-api-key nil)
+        (process-environment (copy-sequence process-environment)))
+    (setenv gemit--local-api-key-env-var)
     (gemit-test--with-http-responses
         (list (gemit-test--fixture gemit-test--health-body)
               (gemit-test--fixture gemit-test--models-body)
@@ -340,6 +379,8 @@
                            (concat gemit-test--local-root
                                    gemit-test--chat-completions-path))))
       (should (equal "GET" (plist-get (car requests) :method)))
+      (should-not (gemit-test--authorization-header (car requests)))
+      (should-not (gemit-test--authorization-header (cadr requests)))
       (should (equal "POST" (plist-get completion :method)))
       (should (equal '(("content-type" . "application/json"))
                      (plist-get completion :headers)))
@@ -349,6 +390,47 @@
       (should (eq :false (plist-get payload :stream)))
       (should (equal "system λ" (plist-get (aref messages 0) :content)))
       (should (equal "diff — café" (plist-get (aref messages 1) :content))))))
+
+(ert-deftest gemit-test-local-api-key-file-is-resolved-once-for-all-endpoints ()
+  (let ((file (make-temp-file "gemit-local-key"))
+        (records nil)
+        (result nil)
+        (resolve-count 0)
+        (gemit-backend 'local)
+        (gemit-local-api-key nil)
+        (gemit-local-model nil)
+        (process-environment (copy-sequence process-environment)))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert " \t" gemit-test--file-local-api-key " \n"))
+          (setenv gemit--local-api-key-env-var)
+          (setq gemit-local-api-key file)
+          (gemit-test--with-http-responses
+              (list (gemit-test--fixture gemit-test--health-body)
+                    (gemit-test--fixture gemit-test--models-body)
+                    (gemit-test--fixture gemit-test--completion-body))
+              records
+            (let ((resolve (symbol-function 'gemit--resolve-api-key)))
+              (cl-letf (((symbol-function 'gemit--resolve-api-key)
+                         (lambda (key-or-file)
+                           (setq resolve-count (1+ resolve-count))
+                           (funcall resolve key-or-file))))
+                (gemit--request-async
+                 gemit-test--diff gemit-test--system-prompt
+                 (lambda (response error-msg)
+                   (setq result (list response error-msg)))))))
+          (should (equal (list gemit-test--local-content nil) result))
+          (should (= 1 resolve-count))
+          (let ((requests (reverse records)))
+            (should (= 3 (length requests)))
+            (should (cl-every
+                     (lambda (request)
+                       (equal (concat gemit-test--bearer-prefix
+                                      gemit-test--file-local-api-key)
+                              (gemit-test--authorization-header request)))
+                     requests))))
+      (delete-file file))))
 
 (ert-deftest gemit-test-real-loopback-transport-bypasses-proxies ()
   (require 'url-http)
@@ -393,7 +475,10 @@
   (let ((records nil)
         (result nil)
         (gemit-backend 'local)
-        (gemit-local-model "explicit-alias"))
+        (gemit-local-model "explicit-alias")
+        (gemit-local-api-key gemit-test--local-api-key)
+        (process-environment (copy-sequence process-environment)))
+    (setenv gemit--local-api-key-env-var)
     (gemit-test--with-http-responses
         (list (gemit-test--fixture gemit-test--health-body)
               (gemit-test--fixture gemit-test--completion-body))
@@ -405,6 +490,12 @@
     (should (= 2 (length records)))
     (should (equal (concat gemit-test--local-root gemit-test--health-path)
                    (plist-get (car (last records)) :url)))
+    (should (cl-every
+             (lambda (record)
+               (equal (concat gemit-test--bearer-prefix
+                              gemit-test--local-api-key)
+                      (gemit-test--authorization-header record)))
+             records))
     (should (equal "explicit-alias"
                    (plist-get (gemit-test--json-request-body (car records)) :model)))))
 
@@ -413,6 +504,8 @@
          (list
           (list (list (gemit-test--fixture "{}" '(:error (error http 503))))
                 nil "HTTP 503")
+          (list (list (gemit-test--fixture "{}" '(:error (error http 401))))
+                gemit-test--configured-model "HTTP 401")
           (list (list (gemit-test--fixture (json-serialize '(:status "loading"))))
                 nil "not ready")
           (list (list (gemit-test--fixture "{"))
@@ -483,10 +576,13 @@
         (key-lookups 0)
         (answers '(nil t))
         (gemit-backend 'auto)
-        (gemit-local-model gemit-test--configured-model))
+        (gemit-local-model gemit-test--configured-model)
+        (gemit-local-api-key gemit-test--local-api-key)
+        (process-environment (copy-sequence process-environment)))
+    (setenv gemit--local-api-key-env-var)
     (gemit-test--with-http-responses
-        (list (gemit-test--fixture nil '(:error (error http 503)))
-              (gemit-test--fixture nil '(:error (error http 503))))
+        (list (gemit-test--fixture nil '(:error (error http 401)))
+              (gemit-test--fixture nil '(:error (error http 401))))
         records
       (cl-letf (((symbol-function 'y-or-n-p)
                  (lambda (prompt)
@@ -495,10 +591,12 @@
                 ((symbol-function 'gemit--api-key-for-setting)
                  (lambda (&rest _) (setq key-lookups (1+ key-lookups))
                    (error "refusal must not look up Gemini key")))
-                ((symbol-function 'gemit--gemini-request-async)
-                 (lambda (_prompt _system callback &optional _config)
-                   (setq gemini-calls (1+ gemini-calls))
-                   (funcall callback "cloud" nil))))
+                 ((symbol-function 'gemit--gemini-request-async)
+                  (lambda (_prompt _system callback &optional _config)
+                    (setq gemini-calls (1+ gemini-calls))
+                    (funcall callback "cloud" nil)))
+                 ((symbol-function 'read-passwd)
+                  (lambda (&rest _) (error "local failures must not prompt for a key"))))
         (dotimes (_ 2)
           (gemit--request-async
            gemit-test--staged-diff gemit-test--system-prompt
@@ -512,8 +610,42 @@
     (should (= 1 gemini-calls))
     (should (= 0 key-lookups))
     (should (= 2 (length records)))
-    (should (member "Gemini fallback declined; staged diff was not sent"
+    (should (member gemit-test--fallback-declined
                     (mapcar #'cadr results))))))
+
+(ert-deftest gemit-test-auto-declined-local-401-never-looks-up-cloud-key ()
+  (let ((records nil)
+        (result nil)
+        (key-lookups 0)
+        (gemini-calls 0)
+        (gemit-backend 'auto)
+        (gemit-local-model gemit-test--configured-model)
+        (gemit-local-api-key gemit-test--local-api-key)
+        (process-environment (copy-sequence process-environment)))
+    (setenv gemit--local-api-key-env-var)
+    (gemit-test--with-http-responses
+        (list (gemit-test--fixture nil '(:error (error http 401))))
+        records
+      (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) nil))
+                ((symbol-function 'gemit--api-key-for-setting)
+                 (lambda (&rest _)
+                   (setq key-lookups (1+ key-lookups))
+                   (error "declined fallback must not look up Gemini key")))
+                ((symbol-function 'gemit--gemini-request-async)
+                 (lambda (&rest _)
+                   (setq gemini-calls (1+ gemini-calls))))
+                ((symbol-function 'read-passwd)
+                 (lambda (&rest _) (error "local credentials must not prompt"))))
+        (gemit--request-async
+         gemit-test--diff gemit-test--system-prompt
+         (lambda (response error-msg) (setq result (list response error-msg)))))
+    (should (equal (list nil gemit-test--fallback-declined)
+                   result))
+    (should (= 0 key-lookups))
+    (should (= 0 gemini-calls))
+    (should (= 1 (length records)))
+    (should (equal (concat gemit-test--bearer-prefix gemit-test--local-api-key)
+                   (gemit-test--authorization-header (car records)))))))
 
 (ert-deftest gemit-test-auto-consent-sends-entire-diff-to-gemini ()
   (let ((records nil)
@@ -521,9 +653,12 @@
         (asked nil)
         (gemit-backend 'auto)
         (gemit-local-model gemit-test--configured-model)
+        (gemit-local-api-key gemit-test--local-api-key)
+        (process-environment (copy-sequence process-environment))
         (gemit--api-key-cache "cached-key"))
+    (setenv gemit--local-api-key-env-var)
     (gemit-test--with-http-responses
-        (list (gemit-test--fixture nil '(:error (error http 503)))
+        (list (gemit-test--fixture nil '(:error (error http 401)))
               (gemit-test--fixture gemit-test--gemini-body))
         records
       (cl-letf (((symbol-function 'y-or-n-p)
@@ -537,23 +672,37 @@
       (should (= 2 (length requests)))
       (should (string-prefix-p gemit-test--local-root
                                (plist-get (car requests) :url)))
+      (should (equal (concat gemit-test--bearer-prefix
+                             gemit-test--local-api-key)
+                     (gemit-test--authorization-header (car requests))))
       (should (string-prefix-p "https://generativelanguage.googleapis.com/"
                                (plist-get (cadr requests) :url)))
+      (should-not (string-match-p gemit-test--local-api-key
+                                  (plist-get (cadr requests) :url)))
+      (should-not (string-match-p
+                   gemit-test--local-api-key
+                   (decode-coding-string (plist-get (cadr requests) :data) 'utf-8)))
+      (should-not (gemit-test--authorization-header (cadr requests)))
+      (should (equal `(("content-type" . ,gemit--json-content-type))
+                     (plist-get (cadr requests) :headers)))
       (should (string-match-p gemit-test--staged-diff
                               (decode-coding-string
-                                (plist-get (cadr requests) :data) 'utf-8)))))))
+                               (plist-get (cadr requests) :data) 'utf-8)))))))
 
 (ert-deftest gemit-test-gemini-backend-bypasses-local-check-and-consent ()
   (let ((records nil)
         (result nil)
         (gemit-backend 'gemini)
         (gemit-local-url nil)
+        (gemit-local-api-key 17)
         (gemit--api-key-cache "cached-key"))
     (gemit-test--with-http-responses
         (list (gemit-test--fixture gemit-test--gemini-body))
         records
       (cl-letf (((symbol-function 'y-or-n-p)
-                 (lambda (&rest _) (error "gemini mode must not ask"))))
+                 (lambda (&rest _) (error "gemini mode must not ask")))
+                ((symbol-function 'gemit--local-api-key)
+                 (lambda () (error "gemini mode must not resolve local key"))))
         (gemit--request-async
          gemit-test--diff gemit-test--system-prompt
          (lambda (response error-msg) (setq result (list response error-msg)))))
@@ -856,6 +1005,39 @@ NAME labels the test buffer; QUERY-COUNT is incremented if killing prompts."
     (should (= 1 calls))
     (should (string-match-p "key lookup failed" (cadr result)))))
 
+(ert-deftest gemit-test-invalid-local-api-key-does-not-start-or-leak-request ()
+  (let ((messages nil)
+        (request-count 0)
+        (result nil)
+        (gemit-backend 'auto)
+        (gemit-local-api-key
+         (concat gemit-test--local-api-key "\r\nX-Gemit-Test: injected"))
+        (process-environment (copy-sequence process-environment)))
+    (setenv gemit--local-api-key-env-var)
+    (cl-letf (((symbol-function 'url-retrieve)
+               (lambda (&rest _)
+                 (setq request-count (1+ request-count))
+                 (error "invalid credentials must not start a request")))
+              ((symbol-function 'message)
+               (lambda (format-string &rest args)
+                 (push (apply #'format format-string args) messages)))
+              ((symbol-function 'y-or-n-p) (lambda (&rest _) nil))
+              ((symbol-function 'gemit--gemini-request-async)
+               (lambda (&rest _) (error "declined fallback must not reach Gemini")))
+              ((symbol-function 'read-passwd)
+               (lambda (&rest _) (error "local credentials must not prompt"))))
+      (gemit--request-async
+       gemit-test--diff gemit-test--system-prompt
+       (lambda (response error-msg) (setq result (list response error-msg)))))
+    (should (= 0 request-count))
+    (should (null (car result)))
+    (should messages)
+    (should (cl-every (lambda (message)
+                        (not (string-match-p gemit-test--local-api-key message)))
+                      messages))
+    (should (equal gemit-test--fallback-declined
+                   (cadr result)))))
+
 (ert-deftest gemit-test-pending-request-uses-configuration-snapshot ()
   (let ((records nil)
         (timers nil)
@@ -865,12 +1047,17 @@ NAME labels the test buffer; QUERY-COUNT is incremented if killing prompts."
         (gemit-backend 'local)
         (gemit-local-url gemit-test--local-root)
         (gemit-local-model "captured-model")
+        (gemit-local-api-key gemit-test--local-api-key)
+        (process-environment (copy-sequence process-environment))
         (gemit-local-availability-timeout 3)
         (gemit-local-generation-timeout 45))
+    (setenv gemit--local-api-key-env-var)
     (gemit-test--with-fake-timers timers
       (cl-letf (((symbol-function 'url-retrieve)
                  (lambda (url callback &rest _)
-                   (push (list url url-request-method url-request-data) records)
+                   (push (list url url-request-method url-request-data
+                               url-request-extra-headers)
+                         records)
                     (if (string-suffix-p gemit-test--health-path url)
                        (setq pending-health callback
                              health-buffer (generate-new-buffer " *gemit-pending-health*"))
@@ -886,13 +1073,22 @@ NAME labels the test buffer; QUERY-COUNT is incremented if killing prompts."
       (setq gemit-backend 'gemini
             gemit-local-url "http://elsewhere.invalid:9999"
             gemit-local-model "changed-model"
+            gemit-local-api-key gemit-test--other-local-api-key
             gemit-local-generation-timeout 1)
+      (setenv gemit--local-api-key-env-var gemit-test--env-local-api-key)
       (with-current-buffer health-buffer
         (insert (decode-coding-string gemit-test--health-body 'utf-8))
         (let ((url-http-end-of-headers (point-min)))
           (funcall pending-health nil)))
       (should (equal (list gemit-test--local-content nil) result))
       (should (= 2 (length records)))
+      (should (cl-every
+               (lambda (record)
+                 (equal (concat gemit-test--bearer-prefix
+                                gemit-test--local-api-key)
+                        (cdr (assoc gemit-test--authorization-header-name
+                                    (nth 3 record)))))
+               records))
       (should (equal (concat gemit-test--local-root
                              gemit-test--chat-completions-path)
                      (car (car records))))
