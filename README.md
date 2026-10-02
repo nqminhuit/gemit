@@ -37,6 +37,8 @@ Alternatively, set `GEMIT_LOCAL_API_KEY`. A nonblank `gemit-local-api-key`
 setting (including a file's contents) takes precedence; nil or a blank value
 falls back to the environment variable. The local credential is optional by
 default, is never prompted for, and is separate from the Google Gemini key.
+Local Bearer credentials must contain ASCII characters; non-ASCII values are
+rejected.
 When configured, it is sent as a Bearer token to local health, model-discovery,
 and completion endpoints.
 
@@ -110,5 +112,6 @@ emacs -Q --batch -L . -L test -l test/gemit-test.el \
   -f ert-run-tests-batch-and-exit
 ```
 
-HTTP and timer behavior is tested with deterministic stubs; no model, live
-Magit buffer, or network access is required.
+HTTP retrieval and timer behavior use deterministic stubs, while local HTTP
+request assembly uses Emacs's real URL builder. No model, live Magit buffer, or
+network access is required.

@@ -158,10 +158,13 @@ Reject values that cannot safely be used in an HTTP header."
     (unless (stringp key)
       (error "%s" gemit--local-api-key-error))
     (let ((trimmed (string-trim key)))
-      (when (string-match-p "[\r\n]" trimmed)
+      (when (or (string-match-p "[\r\n]" trimmed)
+                (cl-some (lambda (character) (> character 127))
+                         (string-to-list trimmed)))
         (error "%s" gemit--local-api-key-error))
       (unless (string-empty-p trimmed)
-        trimmed))))
+        ;; Keep the ASCII Bearer header byte-compatible with the UTF-8 body.
+        (encode-coding-string trimmed 'us-ascii)))))
 
 (defun gemit--local-api-key ()
   "Resolve the local API key setting, then its environment fallback.
