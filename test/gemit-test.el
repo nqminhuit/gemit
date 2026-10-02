@@ -24,6 +24,8 @@
 (defvar url-proxy-services)
 (defvar url-proxy-locator)
 (defvar git-commit-summary-max-length)
+(declare-function url-http-create-request "url-http" ())
+(defconst gemit-test--empty-string "")
 
 ;; `cl-letf' needs an existing function cell to stub; CI has no Magit, so
 ;; provide a fallback definition there.  Where Magit is installed this is
@@ -36,12 +38,14 @@
 (defconst gemit-test--staged-diff "entire staged diff")
 (defconst gemit-test--system-prompt "system")
 (defconst gemit-test--diff "diff")
-(defconst gemit-test--empty-string "")
 (defconst gemit-test--api-key "AIza-key")
 (defconst gemit-test--local-api-key "local-test-key")
 (defconst gemit-test--other-local-api-key "changed-local-key")
 (defconst gemit-test--env-local-api-key "env-local-key")
 (defconst gemit-test--file-local-api-key "file-local-key")
+(defconst gemit-test--unicode-local-model "Qwen/模型-αλφα-🧪")
+(defconst gemit-test--unicode-local-diff "Update café, 東京, and 🧪 support")
+(defconst gemit-test--non-ascii-local-api-key "local-secret-é")
 (defconst gemit-test--authorization-header-name "Authorization")
 (defconst gemit-test--bearer-prefix "Bearer ")
 (defconst gemit-test--fallback-declined
@@ -117,6 +121,36 @@
   (json-parse-string
    (decode-coding-string (plist-get record :data) 'utf-8)
    :object-type 'plist :array-type 'array :false-object :false))
+
+(defun gemit-test--real-http-request (record)
+  "Assemble RECORD with the real URL HTTP builder, without connecting."
+  (require 'url-http)
+  (with-temp-buffer
+    ;; These URL variables are buffer-local request state in url-http.
+    (setq-local url-http-target-url
+                (url-generic-parse-url (plist-get record :url))
+                url-http-method (plist-get record :method)
+                url-http-data (plist-get record :data)
+                url-http-extra-headers (plist-get record :headers)
+                url-http-proxy nil
+                url-http-referer nil
+                url-http-extensions-header nil
+                url-http-attempt-keepalives t
+                url-http-version "1.1"
+                url-mime-accept-string gemit--json-content-type)
+    (url-http-create-request)))
+
+(defun gemit-test--http-request-body (request)
+  "Return the byte body from assembled HTTP REQUEST."
+  (let ((separator (string-match "\r\n\r\n" request)))
+    (unless separator
+      (error "HTTP request has no header/body separator"))
+    (substring request (+ separator 4))))
+
+(defun gemit-test--http-request-content-length (request)
+  "Return the Content-Length header from assembled HTTP REQUEST."
+  (when (string-match "Content-length: \\([0-9]+\\)\r\n" request)
+    (string-to-number (match-string 1 request))))
 
 ;;;; gemit--resolve-api-key
 
@@ -348,6 +382,118 @@
       (should-not (gemit--local-api-key)))
     (let ((gemit-local-api-key 17))
       (should-error (gemit--local-api-key) :type 'error))))
+
+(ert-deftest gemit-test-local-ascii-keys-and-bearer-headers-are-unibyte ()
+  (let ((file (make-temp-file "gemit-local-key"))
+        (process-environment (copy-sequence process-environment))
+        (gemit-local-api-key nil))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert " \t" gemit-test--file-local-api-key " \n"))
+          (dolist (source
+                   (list (list (string-to-multibyte gemit-test--local-api-key)
+                               nil)
+                         (list file nil)
+                         (list nil (string-to-multibyte
+                                    gemit-test--env-local-api-key))))
+            (setq gemit-local-api-key (car source))
+            (setenv gemit--local-api-key-env-var (cadr source))
+            (let* ((expected (if (equal gemit-local-api-key file)
+                                 gemit-test--file-local-api-key
+                               (or (cadr source) gemit-test--local-api-key)))
+                   (key (gemit--local-api-key))
+                   (authorization
+                    (cdr (assoc gemit-test--authorization-header-name
+                                (gemit--local-request-headers key)))))
+              (when (equal gemit-local-api-key file)
+                (should (multibyte-string-p
+                         (gemit--resolve-api-key file))))
+              (should (equal expected key))
+              (should-not (multibyte-string-p key))
+              (should (equal (concat gemit-test--bearer-prefix expected)
+                             authorization))
+              (should-not (multibyte-string-p authorization)))))
+      (delete-file file))))
+
+(ert-deftest gemit-test-local-http-request-is-byte-safe-with-unicode-content ()
+  (let ((records nil)
+        (result nil)
+        (system-prompt (default-value 'gemit-commit-prompt))
+        (gemit-backend 'auto)
+        (gemit-local-model gemit-test--unicode-local-model)
+        (gemit-local-api-key (string-to-multibyte gemit-test--local-api-key))
+        (process-environment (copy-sequence process-environment)))
+    (setenv gemit--local-api-key-env-var)
+    (gemit-test--with-http-responses
+        (list (gemit-test--fixture gemit-test--health-body)
+              (gemit-test--fixture gemit-test--completion-body))
+        records
+      (cl-letf (((symbol-function 'y-or-n-p)
+                 (lambda (&rest _) (error "successful local request asked for fallback")))
+                ((symbol-function 'gemit--api-key-for-setting)
+                 (lambda (&rest _) (error "local request looked up Gemini key")))
+                ((symbol-function 'gemit--gemini-request-async)
+                 (lambda (&rest _) (error "local request called Gemini"))))
+        (gemit--request-async
+         gemit-test--unicode-local-diff system-prompt
+         (lambda (response error-msg) (setq result (list response error-msg)))))
+    (should (equal (list gemit-test--local-content nil) result))
+    (should (string-match-p "≤50 chars" system-prompt))
+    (let* ((completion (car records))
+           (authorization (gemit-test--authorization-header completion))
+           (request (gemit-test--real-http-request completion))
+           (body (gemit-test--http-request-body request))
+           (payload (json-parse-string
+                     (decode-coding-string body 'utf-8)
+                     :object-type 'plist :array-type 'array :false-object :false))
+           (messages (plist-get payload :messages)))
+      (should (= 2 (length records)))
+      (should (equal (concat gemit-test--bearer-prefix gemit-test--local-api-key)
+                     authorization))
+      (should-not (multibyte-string-p authorization))
+      (should-not (multibyte-string-p request))
+      (should (= (length request) (string-bytes request)))
+      (should (equal body (plist-get completion :data)))
+      (should (= (string-bytes body)
+                 (gemit-test--http-request-content-length request)))
+      (should (equal gemit-test--unicode-local-model (plist-get payload :model)))
+      (should (eq :false (plist-get payload :stream)))
+      (should (equal system-prompt (plist-get (aref messages 0) :content)))
+      (should (equal gemit-test--unicode-local-diff
+                     (plist-get (aref messages 1) :content)))))))
+
+(ert-deftest gemit-test-non-ascii-local-api-keys-are-rejected-safely ()
+  (let ((file (make-temp-file "gemit-local-key")))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert gemit-test--non-ascii-local-api-key))
+          (dolist (source
+                   (list (list (string-to-multibyte
+                                gemit-test--non-ascii-local-api-key)
+                               nil)
+                         (list file nil)
+                         (list nil (string-to-multibyte
+                                    gemit-test--non-ascii-local-api-key))
+                         (list (unibyte-string ?x 255) nil)))
+            (let ((process-environment (copy-sequence process-environment))
+                  (gemit-backend 'local)
+                  (gemit-local-api-key (car source))
+                  (request-count 0)
+                  (result nil))
+              (setenv gemit--local-api-key-env-var (cadr source))
+              (cl-letf (((symbol-function 'url-retrieve)
+                         (lambda (&rest _)
+                           (setq request-count (1+ request-count))
+                           (error "invalid key reached URL retrieval"))))
+                (gemit--request-async
+                 gemit-test--diff gemit-test--system-prompt
+                 (lambda (response error-msg)
+                   (setq result (list response error-msg)))))
+              (should (= 0 request-count))
+              (should (equal (list nil gemit--local-api-key-error) result)))))
+      (delete-file file))))
 
 (ert-deftest gemit-test-local-success-discovers-model-and-sends-json-false ()
   (let ((records nil)
@@ -725,8 +871,7 @@ NAME labels the test buffer; QUERY-COUNT is incremented if killing prompts."
     buffer))
 
 (ert-deftest gemit-test-local-timeout-aborts-process-without-querying ()
-  (let ((timers nil)
-        (result nil)
+  (let ((result nil)
         (calls 0)
         (calls-during-startup nil)
         (query-count (list 0))
@@ -764,8 +909,7 @@ NAME labels the test buffer; QUERY-COUNT is incremented if killing prompts."
       (should (= 1 calls)))))
 
 (ert-deftest gemit-test-auto-timeout-cleans-before-fallback-consent ()
-  (let ((timers nil)
-        (result nil)
+  (let ((result nil)
         (calls 0)
         (prompt-calls 0)
         (key-lookups 0)
@@ -807,8 +951,7 @@ NAME labels the test buffer; QUERY-COUNT is incremented if killing prompts."
       (should (= 0 (car query-count)))))))
 
 (ert-deftest gemit-test-local-generation-timeout-aborts-process-without-querying ()
-  (let ((timers nil)
-        (result nil)
+  (let ((result nil)
         (calls 0)
         (query-count (list 0))
         pending-callback generation-buffer generation-process
@@ -854,8 +997,7 @@ NAME labels the test buffer; QUERY-COUNT is incremented if killing prompts."
       (should (= 1 calls)))))
 
 (ert-deftest gemit-test-local-availability-timeout-completes-once-and-cleans-late-buffer ()
-  (let ((timers nil)
-        (result nil)
+  (let ((result nil)
         (calls 0)
         pending-callback
         request-buffer
@@ -887,11 +1029,9 @@ NAME labels the test buffer; QUERY-COUNT is incremented if killing prompts."
       (should (= 1 calls)))))
 
 (ert-deftest gemit-test-local-generation-timeout-bounds-completion-request ()
-  (let ((timers nil)
-        (records nil)
+  (let ((records nil)
         (result nil)
         (calls 0)
-        pending-callback
         generation-buffer
         (gemit-backend 'local)
         (gemit-local-model nil)
@@ -900,18 +1040,17 @@ NAME labels the test buffer; QUERY-COUNT is incremented if killing prompts."
       (cl-letf (((symbol-function 'url-retrieve)
                  (lambda (url callback &rest _)
                    (push url records)
-                    (if (string-suffix-p gemit-test--chat-completions-path url)
-                       (setq pending-callback callback
-                             generation-buffer
+                   (if (string-suffix-p gemit-test--chat-completions-path url)
+                       (setq generation-buffer
                              (generate-new-buffer " *gemit-generation*"))
                      (let ((buffer (generate-new-buffer " *gemit-fast-http*")))
                        (with-current-buffer buffer
-                          (insert (if (string-suffix-p gemit-test--health-path url)
+                         (insert (if (string-suffix-p gemit-test--health-path url)
                                      gemit-test--health-body
                                    gemit-test--models-body))
                          (let ((url-http-end-of-headers (point-min)))
                            (funcall callback nil)))
-                        buffer)))))
+                       buffer)))))
         (gemit--request-async
          gemit-test--diff gemit-test--system-prompt
          (lambda (response error-msg)
@@ -932,7 +1071,6 @@ NAME labels the test buffer; QUERY-COUNT is incremented if killing prompts."
     (let ((fixture (car case))
           (expected (cdr case))
           (records nil)
-          (timers nil)
           (result nil)
           (calls 0)
           (gemit-backend 'local)
@@ -1040,7 +1178,6 @@ NAME labels the test buffer; QUERY-COUNT is incremented if killing prompts."
 
 (ert-deftest gemit-test-pending-request-uses-configuration-snapshot ()
   (let ((records nil)
-        (timers nil)
         (result nil)
         pending-health
         health-buffer
